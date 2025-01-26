@@ -5,8 +5,9 @@ interface QuoteInput {
     sourceTokenMint: string;
     targetTokenMint: string;
     amount: number;
-    slippageTolerance?: number;// implemented default fault tolerance slippage
-    rpcEndpoint?: string; // Custom RPC endpoint (default: mainnet-beta) we can change later, idk
+    slippageTolerance?: number; // Default to 0.5%
+    rpcEndpoint?: string; // Customizable RPC endpoint
+    verbose?: boolean; // Enable debug logging
 }
 
 interface QuoteOutput {
@@ -19,7 +20,7 @@ interface QuoteOutput {
         mint: string;
         decimals: number;
         estimatedAmount: number;
-        minimumAmount: number; // After considering slippage
+        minimumAmount: number;
     };
     fees: {
         tradeFee: number;
@@ -28,12 +29,18 @@ interface QuoteOutput {
     poolAddresses: string[];
 }
 
-async function retryConnection(rpcEndpoint: string, retries: number = 3, delay: number = 1000): Promise<Connection> {
+async function retryConnection(
+    rpcEndpoint: string,
+    retries = 3,
+    delay = 1000
+): Promise<Connection> {
     for (let attempt = 0; attempt < retries; attempt++) {
         try {
             return new Connection(rpcEndpoint, "confirmed");
         } catch (error) {
-            if (attempt === retries - 1) throw new Error("Failed to establish connection after multiple attempts.");
+            if (attempt === retries - 1) {
+                throw new Error("Failed to establish a connection after retries.");
+            }
             await new Promise((resolve) => setTimeout(resolve, delay));
         }
     }
@@ -46,19 +53,21 @@ async function getQuote(params: QuoteInput): Promise<QuoteOutput> {
         amount,
         slippageTolerance = 0.5,
         rpcEndpoint = "https://api.mainnet-beta.solana.com",
+        verbose = false,
     } = params;
 
-    // Establish connection with retry mechanism
+    if (!sourceTokenMint || !targetTokenMint || amount <= 0) {
+        throw new Error("Invalid parameters: Token mints must be valid, and amount must be greater than zero.");
+    }
+
     const connection = await retryConnection(rpcEndpoint);
 
     try {
-        // Fetch pools with error handling and caching
         const pools = await Liquidity.fetchAllPools({
             connection,
             programId: LIQUIDITY_PROGRAM_ID_V4,
         });
 
-        // Filter relevant pools for the token pair using optimized filtering
         const relevantPools = pools.filter((pool) => {
             const tokenA = pool.tokenMintA.toBase58();
             const tokenB = pool.tokenMintB.toBase58();
@@ -68,39 +77,47 @@ async function getQuote(params: QuoteInput): Promise<QuoteOutput> {
             );
         });
 
-        if (relevantPools.length === 0) {
-            throw new Error("No relevant pools found for the given token pair.");
+        if (verbose) {
+            console.log("Filtered Pools:", relevantPools.map((p) => p.id.toBase58()));
         }
 
-        // Compute the best quote with precision handling
-        let bestQuote: Trade | null = null;
-        let bestPool: any = null;
+        if (relevantPools.length === 0) {
+            throw new Error("No relevant pools found for the specified token pair.");
+        }
 
-        for (const pool of relevantPools) {
+        const tradePromises = relevantPools.map(async (pool) => {
             const tradeOptions: TradeOptions = {
                 connection,
                 poolKeys: pool,
                 amountIn: amount,
                 slippage: slippageTolerance / 100,
             };
+            return {
+                pool,
+                quote: await Liquidity.computeTrade(tradeOptions),
+            };
+        });
 
-            const quote = await Liquidity.computeTrade(tradeOptions);
+        const trades = await Promise.all(tradePromises);
 
-            if (!bestQuote || (quote.estimatedAmountOut && quote.estimatedAmountOut > (bestQuote?.estimatedAmountOut || 0))) {
-                bestQuote = quote;
-                bestPool = pool;
-            }
+        const bestTrade = trades.reduce((best, current) =>
+            !best || (current.quote.estimatedAmountOut > best.quote.estimatedAmountOut) ? current : best
+        );
+
+        if (!bestTrade || !bestTrade.quote) {
+            throw new Error("No valid trade quote found.");
         }
 
-        if (!bestQuote) {
-            throw new Error("Failed to compute trade quote.");
-        }
+        const bestPool = bestTrade.pool;
+        const bestQuote = bestTrade.quote;
 
-        // Extract fee details with enhanced precision
-        const tradeFee = parseFloat(((bestPool.tradeFeeNumerator / bestPool.tradeFeeDenominator) * amount).toFixed(bestPool.tokenMintADecimals));
-        const ownerFee = parseFloat(((bestPool.ownerFeeNumerator / bestPool.ownerFeeDenominator) * amount).toFixed(bestPool.tokenMintADecimals));
+        const tradeFee = parseFloat(
+            ((bestPool.tradeFeeNumerator / bestPool.tradeFeeDenominator) * amount).toFixed(bestPool.tokenMintADecimals)
+        );
+        const ownerFee = parseFloat(
+            ((bestPool.ownerFeeNumerator / bestPool.ownerFeeDenominator) * amount).toFixed(bestPool.tokenMintADecimals)
+        );
 
-        // Format result with precision handling
         return {
             inputToken: {
                 mint: sourceTokenMint,
@@ -110,8 +127,12 @@ async function getQuote(params: QuoteInput): Promise<QuoteOutput> {
             outputToken: {
                 mint: targetTokenMint,
                 decimals: bestPool.tokenMintBDecimals,
-                estimatedAmount: parseFloat(bestQuote.estimatedAmountOut.toFixed(bestPool.tokenMintBDecimals)),
-                minimumAmount: parseFloat(bestQuote.minimumAmountOut.toFixed(bestPool.tokenMintBDecimals)),
+                estimatedAmount: parseFloat(
+                    bestQuote.estimatedAmountOut.toFixed(bestPool.tokenMintBDecimals)
+                ),
+                minimumAmount: parseFloat(
+                    bestQuote.minimumAmountOut.toFixed(bestPool.tokenMintBDecimals)
+                ),
             },
             fees: {
                 tradeFee,
@@ -120,20 +141,21 @@ async function getQuote(params: QuoteInput): Promise<QuoteOutput> {
             poolAddresses: [bestPool.id.toBase58()],
         };
     } catch (error) {
-        throw new Error(`Error fetching quote: ${error.message}`);
+        throw new Error(`Error during quote computation: ${error.message}`);
     }
 }
 
 (async () => {
     try {
         const quote = await getQuote({
-            sourceTokenMint: "SOL_MINT_ADDR", // Example SOL mint address
-            targetTokenMint: "EXAMPLE_USDC_MINT_ADDR", // Example USDC mint address
-            amount: 1_000_000, // Example amount in lamports or smallest unit
+            sourceTokenMint: "SOL_MINT_ADDR",
+            targetTokenMint: "EXAMPLE_USDC_MINT_ADDR",
+            amount: 1_000_000,
+            verbose: true,
         });
 
-        console.log("Swap Quote:", JSON.stringify(quote, null, 2));
+        console.log("Detailed Swap Quote:", JSON.stringify(quote, null, 2));
     } catch (error) {
-        console.error("Error fetching quote:", error);
+        console.error("Error:", error.message);
     }
 })();

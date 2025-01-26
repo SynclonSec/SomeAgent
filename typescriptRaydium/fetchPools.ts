@@ -1,20 +1,21 @@
 import { Connection, PublicKey } from "@solana/web3.js";
 import { Liquidity, LIQUIDITY_PROGRAM_ID_V4 } from "@raydium-io/raydium-sdk";
+import tokenList from "@solana/spl-token-registry"; // Add SPL Token Registry or equivalent library
+
+interface TokenMetadata {
+    mint: string;
+    symbol: string;
+    name: string;
+    decimals: number;
+    logoURI?: string;
+}
 
 interface PoolInfo {
     poolAddress: string;
-    tokenA: {
-        mint: string;
-        decimals: number;
-        reserve: string; 
-    };
-    tokenB: {
-        mint: string;
-        decimals: number;
-        reserve: string; 
-    };
+    tokenA: TokenMetadata & { reserve: string };
+    tokenB: TokenMetadata & { reserve: string };
     liquidity: {
-        totalSupply: string; 
+        totalSupply: string;
         openOrdersAddress: string;
         lpMint: string;
     };
@@ -40,8 +41,17 @@ async function fetchRaydiumPools(): Promise<PoolInfo[]> {
         programId: LIQUIDITY_PROGRAM_ID_V4,
     });
 
-    // filtering non important pools with 0 reserves..
-    const validPools = pools.filter((pool) => pool.tokenAReserve.gt(0) && pool.tokenBReserve.gt(0));
+    /*
+    -token metadata
+    -quick lookup retrieval
+
+    
+    */
+    const tokenMetadataMap = buildTokenMetadataMap();
+
+    const validPools = pools.filter(
+        (pool) => pool.tokenAReserve.gt(0) && pool.tokenBReserve.gt(0)
+    );
 
     const poolInfo = validPools.map((pool) => {
         const tradeFeePercentage = (
@@ -51,17 +61,29 @@ async function fetchRaydiumPools(): Promise<PoolInfo[]> {
             (pool.ownerFeeNumerator / pool.ownerFeeDenominator) * 100
         ).toFixed(2);
 
+        const tokenAInfo = tokenMetadataMap.get(pool.tokenMintA.toBase58()) || {
+            mint: pool.tokenMintA.toBase58(),
+            symbol: "UNKNOWN",
+            name: "Unknown Token",
+            decimals: pool.tokenMintADecimals,
+        };
+
+        const tokenBInfo = tokenMetadataMap.get(pool.tokenMintB.toBase58()) || {
+            mint: pool.tokenMintB.toBase58(),
+            symbol: "UNKNOWN",
+            name: "Unknown Token",
+            decimals: pool.tokenMintBDecimals,
+        };
+
         return {
             poolAddress: pool.id.toBase58(),
             tokenA: {
-                mint: pool.tokenMintA.toBase58(),
-                decimals: pool.tokenMintADecimals,
-                reserve: normalizeReserve(pool.tokenAReserve, pool.tokenMintADecimals),
+                ...tokenAInfo,
+                reserve: normalizeReserve(pool.tokenAReserve, tokenAInfo.decimals),
             },
             tokenB: {
-                mint: pool.tokenMintB.toBase58(),
-                decimals: pool.tokenMintBDecimals,
-                reserve: normalizeReserve(pool.tokenBReserve, pool.tokenMintBDecimals),
+                ...tokenBInfo,
+                reserve: normalizeReserve(pool.tokenBReserve, tokenBInfo.decimals),
             },
             liquidity: {
                 totalSupply: normalizeReserve(pool.liquidity, pool.tokenMintADecimals),
@@ -84,7 +106,23 @@ async function fetchRaydiumPools(): Promise<PoolInfo[]> {
     return poolInfo;
 }
 
-// ret mech
+function buildTokenMetadataMap(): Map<string, TokenMetadata> {
+    const tokenMap = new Map<string, TokenMetadata>();
+    const tokenRegistry = tokenList.filterByChainId(101); // Mainnet chain ID
+
+    tokenRegistry.getList().forEach((token) => {
+        tokenMap.set(token.address, {
+            mint: token.address,
+            symbol: token.symbol,
+            name: token.name,
+            decimals: token.decimals,
+            logoURI: token.logoURI,
+        });
+    });
+
+    return tokenMap;
+}
+
 async function establishConnectionWithRetry(endpoint: string, retries: number): Promise<Connection> {
     let attempt = 0;
     while (attempt < retries) {
@@ -95,7 +133,8 @@ async function establishConnectionWithRetry(endpoint: string, retries: number): 
         } catch (error) {
             attempt++;
             console.warn(`Connection attempt ${attempt} failed. Retrying...`);
-            if (attempt >= retries) throw new Error("Failed to establish RPC connection after multiple attempts.");
+            if (attempt >= retries)
+                throw new Error("Failed to establish RPC connection after multiple attempts.");
         }
     }
 }
@@ -109,7 +148,6 @@ function normalizeReserve(reserve: bigint, decimals: number): string {
         const pools = await fetchRaydiumPools();
         console.log("Raydium Pools:", JSON.stringify(pools, null, 2));
     } catch (error) {
-        console.error("bruh:", error.message);
+        console.error("Error:", error.message);
     }
 })();
-

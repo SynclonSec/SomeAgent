@@ -1,47 +1,80 @@
-import { Connection, PublicKey } from "@solana/web3.js";
-import { Liquidity, LIQUIDITY_PROGRAM_ID_V4, Trade, TradeOptions } from "@raydium-io/raydium-sdk";
+import { Connection } from "@solana/web3.js";
+import { Liquidity, LIQUIDITY_PROGRAM_ID_V4 } from "@raydium-io/raydium-sdk";
+import tokenList from "@solana/spl-token-registry";
+
+interface TokenMetadata {
+    mint: string;
+    symbol: string;
+    name: string;
+    decimals: number;
+    logoURI?: string;
+}
 
 interface QuoteInput {
     sourceTokenMint: string;
     targetTokenMint: string;
     amount: number;
-    slippageTolerance?: number; // Default to 0.5%
-    rpcEndpoint?: string; // Customizable RPC endpoint
-    verbose?: boolean; // Enable debug logging
+    slippageTolerance?: number;
+    rpcEndpoint?: string;
+    verbose?: boolean;
 }
 
 interface QuoteOutput {
     inputToken: {
         mint: string;
+        symbol: string;
+        name: string;
         decimals: number;
         amount: number;
+        amountInBaseUnits: number;
     };
     outputToken: {
         mint: string;
+        symbol: string;
+        name: string;
         decimals: number;
         estimatedAmount: number;
+        estimatedAmountInBaseUnits: number;
         minimumAmount: number;
+        minimumAmountInBaseUnits: number;
     };
     fees: {
         tradeFee: number;
         ownerFee: number;
+        tradeFeeInBaseUnits: number;
+        ownerFeeInBaseUnits: number;
     };
     poolAddresses: string[];
 }
 
-async function retryConnection(
-    rpcEndpoint: string,
-    retries = 3,
-    delay = 1000
-): Promise<Connection> {
-    for (let attempt = 0; attempt < retries; attempt++) {
+function buildTokenMetadataMap(): Map<string, TokenMetadata> {
+    const tokenMap = new Map<string, TokenMetadata>();
+    const tokenRegistry = tokenList.filterByChainId(101);
+
+    tokenRegistry.getList().forEach((token) => {
+        tokenMap.set(token.address, {
+            mint: token.address,
+            symbol: token.symbol,
+            name: token.name,
+            decimals: token.decimals,
+            logoURI: token.logoURI,
+        });
+    });
+
+    return tokenMap;
+}
+
+async function establishConnectionWithRetry(endpoint: string, retries: number): Promise<Connection> {
+    let attempt = 0;
+    while (attempt < retries) {
         try {
-            return new Connection(rpcEndpoint, "confirmed");
+            const connection = new Connection(endpoint, "confirmed");
+            await connection.getVersion();
+            return connection;
         } catch (error) {
-            if (attempt === retries - 1) {
-                throw new Error("Failed to establish a connection after retries.");
-            }
-            await new Promise((resolve) => setTimeout(resolve, delay));
+            attempt++;
+            if (attempt >= retries) throw new Error("Failed to establish RPC connection after retries.");
+            await new Promise((resolve) => setTimeout(resolve, 1000));
         }
     }
 }
@@ -60,7 +93,8 @@ async function getQuote(params: QuoteInput): Promise<QuoteOutput> {
         throw new Error("Invalid parameters: Token mints must be valid, and amount must be greater than zero.");
     }
 
-    const connection = await retryConnection(rpcEndpoint);
+    const connection = await establishConnectionWithRetry(rpcEndpoint, 3);
+    const tokenMetadataMap = buildTokenMetadataMap();
 
     try {
         const pools = await Liquidity.fetchAllPools({
@@ -71,10 +105,9 @@ async function getQuote(params: QuoteInput): Promise<QuoteOutput> {
         const relevantPools = pools.filter((pool) => {
             const tokenA = pool.tokenMintA.toBase58();
             const tokenB = pool.tokenMintB.toBase58();
-            return (
-                (tokenA === sourceTokenMint && tokenB === targetTokenMint) ||
-                (tokenA === targetTokenMint && tokenB === sourceTokenMint)
-            );
+            const isValidPair = (tokenA === sourceTokenMint && tokenB === targetTokenMint) ||
+                               (tokenB === sourceTokenMint && tokenA === targetTokenMint);
+            return isValidPair && pool.tokenAReserve.gt(0) && pool.tokenBReserve.gt(0);
         });
 
         if (verbose) {
@@ -86,59 +119,81 @@ async function getQuote(params: QuoteInput): Promise<QuoteOutput> {
         }
 
         const tradePromises = relevantPools.map(async (pool) => {
-            const tradeOptions: TradeOptions = {
-                connection,
-                poolKeys: pool,
-                amountIn: amount,
-                slippage: slippageTolerance / 100,
-            };
-            return {
-                pool,
-                quote: await Liquidity.computeTrade(tradeOptions),
-            };
+            const isSourceTokenA = pool.tokenMintA.toBase58() === sourceTokenMint;
+            const inputDecimals = isSourceTokenA ? pool.tokenMintADecimals : pool.tokenMintBDecimals;
+            const outputDecimals = isSourceTokenA ? pool.tokenMintBDecimals : pool.tokenMintADecimals;
+
+            try {
+                const tradeOptions = {
+                    connection,
+                    poolKeys: pool,
+                    amountIn: amount,
+                    slippage: slippageTolerance / 100,
+                };
+                const quote = await Liquidity.computeTrade(tradeOptions);
+                return { pool, quote, inputDecimals, outputDecimals };
+            } catch (error) {
+                if (verbose) console.error(`Error processing pool ${pool.id.toBase58()}: ${error.message}`);
+                return null;
+            }
         });
 
-        const trades = await Promise.all(tradePromises);
+        const trades = (await Promise.all(tradePromises)).filter(t => t !== null);
+        if (trades.length === 0) throw new Error("No valid trades could be computed.");
 
-        const bestTrade = trades.reduce((best, current) =>
-            !best || (current.quote.estimatedAmountOut > best.quote.estimatedAmountOut) ? current : best
+        const bestTrade = trades.reduce((best, current) => 
+            (!best || current.quote.estimatedAmountOut > best.quote.estimatedAmountOut) ? current : best
         );
 
-        if (!bestTrade || !bestTrade.quote) {
-            throw new Error("No valid trade quote found.");
-        }
+        const inputTokenMetadata = tokenMetadataMap.get(sourceTokenMint) || {
+            mint: sourceTokenMint,
+            symbol: 'UNKNOWN',
+            name: 'Unknown Token',
+            decimals: bestTrade.inputDecimals,
+        };
 
-        const bestPool = bestTrade.pool;
-        const bestQuote = bestTrade.quote;
+        const outputTokenMetadata = tokenMetadataMap.get(targetTokenMint) || {
+            mint: targetTokenMint,
+            symbol: 'UNKNOWN',
+            name: 'Unknown Token',
+            decimals: bestTrade.outputDecimals,
+        };
 
-        const tradeFee = parseFloat(
-            ((bestPool.tradeFeeNumerator / bestPool.tradeFeeDenominator) * amount).toFixed(bestPool.tokenMintADecimals)
-        );
-        const ownerFee = parseFloat(
-            ((bestPool.ownerFeeNumerator / bestPool.ownerFeeDenominator) * amount).toFixed(bestPool.tokenMintADecimals)
-        );
+        const amountHuman = amount / Math.pow(10, bestTrade.inputDecimals);
+        const tradeFeeBase = (bestTrade.pool.tradeFeeNumerator / bestTrade.pool.tradeFeeDenominator) * amount;
+        const ownerFeeBase = (bestTrade.pool.ownerFeeNumerator / bestTrade.pool.ownerFeeDenominator) * amount;
+        const tradeFeeHuman = tradeFeeBase / Math.pow(10, bestTrade.inputDecimals);
+        const ownerFeeHuman = ownerFeeBase / Math.pow(10, bestTrade.inputDecimals);
+
+        const estimatedAmountHuman = bestTrade.quote.estimatedAmountOut / Math.pow(10, bestTrade.outputDecimals);
+        const minimumAmountHuman = bestTrade.quote.minimumAmountOut / Math.pow(10, bestTrade.outputDecimals);
 
         return {
             inputToken: {
                 mint: sourceTokenMint,
-                decimals: bestPool.tokenMintADecimals,
-                amount,
+                symbol: inputTokenMetadata.symbol,
+                name: inputTokenMetadata.name,
+                decimals: bestTrade.inputDecimals,
+                amount: amountHuman,
+                amountInBaseUnits: amount,
             },
             outputToken: {
                 mint: targetTokenMint,
-                decimals: bestPool.tokenMintBDecimals,
-                estimatedAmount: parseFloat(
-                    bestQuote.estimatedAmountOut.toFixed(bestPool.tokenMintBDecimals)
-                ),
-                minimumAmount: parseFloat(
-                    bestQuote.minimumAmountOut.toFixed(bestPool.tokenMintBDecimals)
-                ),
+                symbol: outputTokenMetadata.symbol,
+                name: outputTokenMetadata.name,
+                decimals: bestTrade.outputDecimals,
+                estimatedAmount: estimatedAmountHuman,
+                estimatedAmountInBaseUnits: bestTrade.quote.estimatedAmountOut,
+                minimumAmount: minimumAmountHuman,
+                minimumAmountInBaseUnits: bestTrade.quote.minimumAmountOut,
             },
             fees: {
-                tradeFee,
-                ownerFee,
+                tradeFee: tradeFeeHuman,
+                ownerFee: ownerFeeHuman,
+                tradeFeeInBaseUnits: tradeFeeBase,
+                ownerFeeInBaseUnits: ownerFeeBase,
             },
-            poolAddresses: [bestPool.id.toBase58()],
+            poolAddresses: [bestTrade.pool.id.toBase58()],
         };
     } catch (error) {
         throw new Error(`Error during quote computation: ${error.message}`);
@@ -153,7 +208,6 @@ async function getQuote(params: QuoteInput): Promise<QuoteOutput> {
             amount: 1_000_000,
             verbose: true,
         });
-
         console.log("Detailed Swap Quote:", JSON.stringify(quote, null, 2));
     } catch (error) {
         console.error("Error:", error.message);

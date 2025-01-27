@@ -1,4 +1,4 @@
-import { Connection } from "@solana/web3.js";
+import { Connection, PublicKey } from "@solana/web3.js";
 import { Liquidity, LIQUIDITY_PROGRAM_ID_V4 } from "@raydium-io/raydium-sdk";
 import tokenList from "@solana/spl-token-registry";
 
@@ -77,6 +77,7 @@ async function establishConnectionWithRetry(endpoint: string, retries: number): 
             await new Promise((resolve) => setTimeout(resolve, 1000));
         }
     }
+    throw new Error("Connection failed after maximum retries");
 }
 
 async function getQuote(params: QuoteInput): Promise<QuoteOutput> {
@@ -97,43 +98,51 @@ async function getQuote(params: QuoteInput): Promise<QuoteOutput> {
     const tokenMetadataMap = buildTokenMetadataMap();
 
     try {
-        const pools = await Liquidity.fetchAllPools({
+        // Fixed: Use fetchAllPoolKeys instead of fetchAllPools
+        const pools = await Liquidity.fetchAllPoolKeys({
             connection,
             programId: LIQUIDITY_PROGRAM_ID_V4,
         });
 
+        // Fixed: Use baseMint/quoteMint instead of tokenMintA/B
         const relevantPools = pools.filter((pool) => {
-            const tokenA = pool.tokenMintA.toBase58();
-            const tokenB = pool.tokenMintB.toBase58();
+            const tokenA = pool.baseMint.toString();
+            const tokenB = pool.quoteMint.toString();
             const isValidPair = (tokenA === sourceTokenMint && tokenB === targetTokenMint) ||
                                (tokenB === sourceTokenMint && tokenA === targetTokenMint);
-            return isValidPair && pool.tokenAReserve.gt(0) && pool.tokenBReserve.gt(0);
+            return isValidPair;
         });
 
         if (verbose) {
-            console.log("Filtered Pools:", relevantPools.map((p) => p.id.toBase58()));
+            console.log("Filtered Pools:", relevantPools.map((p) => p.id.toString()));
         }
 
         if (relevantPools.length === 0) {
             throw new Error("No relevant pools found for the specified token pair.");
         }
 
+        // Fixed: Explicit swap direction handling
         const tradePromises = relevantPools.map(async (pool) => {
-            const isSourceTokenA = pool.tokenMintA.toBase58() === sourceTokenMint;
-            const inputDecimals = isSourceTokenA ? pool.tokenMintADecimals : pool.tokenMintBDecimals;
-            const outputDecimals = isSourceTokenA ? pool.tokenMintBDecimals : pool.tokenMintADecimals;
+            const isSourceTokenBase = pool.baseMint.toString() === sourceTokenMint;
+            const inputDecimals = isSourceTokenBase ? pool.baseDecimals : pool.quoteDecimals;
+            const outputDecimals = isSourceTokenBase ? pool.quoteDecimals : pool.baseDecimals;
 
             try {
+                // Fixed: Add explicit currency mints
                 const tradeOptions = {
                     connection,
                     poolKeys: pool,
                     amountIn: amount,
+                    currencyInMint: new PublicKey(sourceTokenMint),
+                    currencyOutMint: new PublicKey(targetTokenMint),
                     slippage: slippageTolerance / 100,
                 };
+                
                 const quote = await Liquidity.computeTrade(tradeOptions);
                 return { pool, quote, inputDecimals, outputDecimals };
             } catch (error) {
-                if (verbose) console.error(`Error processing pool ${pool.id.toBase58()}: ${error.message}`);
+                const errorMessage = error instanceof Error ? error.message : "Unknown error";
+                if (verbose) console.error(`Error processing pool ${pool.id.toString()}: ${errorMessage}`);
                 return null;
             }
         });
@@ -145,6 +154,7 @@ async function getQuote(params: QuoteInput): Promise<QuoteOutput> {
             (!best || current.quote.estimatedAmountOut > best.quote.estimatedAmountOut) ? current : best
         );
 
+        // Fixed: Use pool's decimals as fallback instead of token registry
         const inputTokenMetadata = tokenMetadataMap.get(sourceTokenMint) || {
             mint: sourceTokenMint,
             symbol: 'UNKNOWN',
@@ -159,9 +169,13 @@ async function getQuote(params: QuoteInput): Promise<QuoteOutput> {
             decimals: bestTrade.outputDecimals,
         };
 
+        // Fixed: Proper decimal handling for all calculations
         const amountHuman = amount / Math.pow(10, bestTrade.inputDecimals);
-        const tradeFeeBase = (bestTrade.pool.tradeFeeNumerator / bestTrade.pool.tradeFeeDenominator) * amount;
-        const ownerFeeBase = (bestTrade.pool.ownerFeeNumerator / bestTrade.pool.ownerFeeDenominator) * amount;
+        const feeDenominator = bestTrade.pool.tradeFeeDenominator.toNumber();
+        
+        const tradeFeeBase = (bestTrade.pool.tradeFeeNumerator.toNumber() / feeDenominator) * amount;
+        const ownerFeeBase = (bestTrade.pool.ownerFeeNumerator.toNumber() / feeDenominator) * amount;
+        
         const tradeFeeHuman = tradeFeeBase / Math.pow(10, bestTrade.inputDecimals);
         const ownerFeeHuman = ownerFeeBase / Math.pow(10, bestTrade.inputDecimals);
 
@@ -193,23 +207,26 @@ async function getQuote(params: QuoteInput): Promise<QuoteOutput> {
                 tradeFeeInBaseUnits: tradeFeeBase,
                 ownerFeeInBaseUnits: ownerFeeBase,
             },
-            poolAddresses: [bestTrade.pool.id.toBase58()],
+            poolAddresses: [bestTrade.pool.id.toString()],
         };
     } catch (error) {
-        throw new Error(`Error during quote computation: ${error.message}`);
+        const errorMessage = error instanceof Error ? error.message : "Unknown error";
+        throw new Error(`Error during quote computation: ${errorMessage}`);
     }
 }
 
+// Example usage with real mint addresses
 (async () => {
     try {
         const quote = await getQuote({
-            sourceTokenMint: "SOL_MINT_ADDR",
-            targetTokenMint: "EXAMPLE_USDC_MINT_ADDR",
-            amount: 1_000_000,
+            sourceTokenMint: "So11111111111111111111111111111111111111112", // SOL
+            targetTokenMint: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", // USDC
+            amount: 1_000_000, // 1 SOL in lamports
             verbose: true,
         });
         console.log("Detailed Swap Quote:", JSON.stringify(quote, null, 2));
     } catch (error) {
-        console.error("Error:", error.message);
+        const errorMessage = error instanceof Error ? error.message : "Unknown error";
+        console.error("Error:", errorMessage);
     }
 })();

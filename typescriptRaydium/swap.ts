@@ -1,7 +1,21 @@
-import { Connection, PublicKey, VersionedTransaction } from "@solana/web3.js";
+import { createHmac } from 'crypto';
+import { Connection, PublicKey, VersionedTransaction, TransactionMessage } from "@solana/web3.js";
 import { Liquidity, LIQUIDITY_PROGRAM_ID_V4 } from "@raydium-io/raydium-sdk";
 import { getQuote, QuoteOutput } from "./getQuote";
 import { establishConnectionWithRetry } from "./sharedUtils";
+
+interface SecureResponse {
+    data: any;
+    sig: string;
+}
+
+function signResponse(data: object): SecureResponse {
+    const hmac = createHmac('sha512', process.env.HMAC_SECRET!);
+    return {
+        data,
+        sig: hmac.update(JSON.stringify(data)).digest('hex')
+    };
+}
 
 interface SwapParams {
     sourceTokenMint: string;
@@ -10,6 +24,7 @@ interface SwapParams {
     slippageTolerance: number;
     userPublicKey: PublicKey;
     rpcEndpoint?: string;
+    nonce?: string; // Add nonce to SwapParams
 }
 
 interface SwapInstructions {
@@ -31,12 +46,12 @@ interface SwapResponse {
     };
 }
 
-export async function prepareSwapTransaction(params: SwapParams): Promise<SwapResponse> {
-    const { sourceTokenMint, targetTokenMint, amountInBaseUnits, slippageTolerance, userPublicKey, rpcEndpoint } = params;
+export async function prepareSwapTransaction(params: SwapParams): Promise<SecureResponse> {
+    const { sourceTokenMint, targetTokenMint, amountInBaseUnits, slippageTolerance, userPublicKey, rpcEndpoint, nonce } = params;
 
     try {
         const connection = await establishConnectionWithRetry(rpcEndpoint || "https://api.mainnet-beta.solana.com", 3);
-        
+
         const quote = await getQuote({
             sourceTokenMint,
             targetTokenMint,
@@ -76,67 +91,78 @@ export async function prepareSwapTransaction(params: SwapParams): Promise<SwapRe
             }).compileToV0Message()
         );
 
-        return {
+        const response = {
             status: "success",
             swapInstructions: {
                 transactionVersion: 'v0',
                 serializedTransaction: Buffer.from(transaction.serialize()).toString('base64'),
                 signers: [userPublicKey],
                 recentBlockhash: blockhash,
-                computeUnits: 1_400_000 
+                computeUnits: 1_400_000
             },
             metadata: {
                 quoteId: `swap-${Date.now()}-${Math.random().toString(36).slice(2, 11)}`,
                 preparedAt: Date.now(),
-                expiresAt: Date.now() + 60_000
+                expiresAt: Date.now() + 60_000,
+                nonce: nonce // Include nonce in the response
             }
         };
 
+        return signResponse(response);
+
     } catch (error) {
-        return {
+        const response = {
             status: "error",
             error: sanitizeError(error),
             metadata: {
                 quoteId: '',
                 preparedAt: Date.now(),
-                expiresAt: Date.now()
+                expiresAt: Date.now(),
+                nonce: nonce // Include nonce in the response
             }
         };
+
+        return signResponse(response);
     }
 }
 
-export async function executeSwap(params: SwapParams): Promise<SwapResponse> {
+export async function executeSwap(params: SwapParams): Promise<SecureResponse> {
     try {
         const preparation = await prepareSwapTransaction(params);
-        if (preparation.status !== "success") throw new Error(preparation.error);
+        if (preparation.data.status !== "success") throw new Error(preparation.data.error);
 
         const connection = await establishConnectionWithRetry(params.rpcEndpoint || "https://api.mainnet-beta.solana.com", 3);
         const transaction = VersionedTransaction.deserialize(
-            Buffer.from(preparation.swapInstructions!.serializedTransaction, 'base64')
+            Buffer.from(preparation.data.swapInstructions!.serializedTransaction, 'base64')
         );
 
         const signature = await connection.sendTransaction(transaction);
         await connection.confirmTransaction({
             signature,
-            blockhash: preparation.swapInstructions!.recentBlockhash,
-            lastValidBlockHeight: (await connection.getBlockhash(preparation.swapInstructions!.recentBlockhash)).value!.lastValidBlockHeight
+            blockhash: preparation.data.swapInstructions!.recentBlockhash,
+            lastValidBlockHeight: (await connection.getBlockhash(preparation.data.swapInstructions!.recentBlockhash)).value!.lastValidBlockHeight
         });
 
-        return {
+        const response = {
             status: "success",
-            metadata: preparation.metadata
+            metadata: preparation.data.metadata
         };
 
+        return signResponse(response);
+
     } catch (error) {
-        return {
+        const response = {
             status: "error",
             error: sanitizeError(error),
             metadata: {
                 quoteId: '',
                 preparedAt: Date.now(),
-                expiresAt: Date.now()
+                expiresAt: Date.now(),
+                nonce: params.nonce // Include nonce in the response
             }
         };
+
+        return signResponse(response);
     }
 }
 

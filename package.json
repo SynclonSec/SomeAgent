@@ -1,1 +1,34 @@
+{
+  "name": "solana-swap-optimizer",
+  "version": "1.0.0",
+  "description": "Cross-language swap route optimizer for Solana",
+  "main": "getQuotes.ts",
+  "scripts": {
+    "build": "tsc",
+    "start": "ts-node getQuotes.ts",
+    "preinstall": "npx npm-check-updates -u",
+    "postinstall": "npm run build"
+  },
+  "dependencies": {
+    "@solana/web3.js": "^1.90.0",
+    "@raydium-io/raydium-sdk": "^0.1.8",
+    "@jup-ag/core": "^3.5.0",
+    "decimal.js": "^10.4.3",
+    "axios": "^1.6.2",
+    "bn.js": "^5.2.1",
+    "buffer-layout": "^1.2.2",
+    "tslib": "^2.6.2"
+  },
+  "devDependencies": {
+    "typescript": "^5.3.3",
+    "ts-node": "^10.9.2",
+    "@types/node": "^20.10.3",
+    "@types/bn.js": "^5.1.5",
+    "@types/decimal.js": "^10.4.4"
+  },
+  "engines": {
+    "node": ">=18.0.0",
+    "npm": ">=9.0.0"
+  }
+}
 

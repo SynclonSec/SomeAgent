@@ -1,28 +1,23 @@
-import { Connection, Transaction, VersionedTransaction } from "@solana/web3.js";
-import { fetchRaydiumPools } from "./fetchPools";
+import { Connection, PublicKey, VersionedTransaction } from "@solana/web3.js";
+import { Liquidity, LIQUIDITY_PROGRAM_ID_V4 } from "@raydium-io/raydium-sdk";
 import { getQuote, QuoteOutput } from "./getQuote";
 import { establishConnectionWithRetry } from "./sharedUtils";
 
-// Shared types for cross-file compatibility
 interface SwapParams {
     sourceTokenMint: string;
     targetTokenMint: string;
     amountInBaseUnits: number;
     slippageTolerance: number;
-    userPublicKey: string;
+    userPublicKey: PublicKey;
     rpcEndpoint?: string;
 }
 
 interface SwapInstructions {
     transactionVersion: 'legacy' | 'v0';
-    serializedMessage: string;
-    signers: string[]; // PDA addresses that need to sign
-    additionalAccounts: string[];
-    instructionData: {
-        programId: string;
-        accounts: string[];
-        data: string;
-    }[];
+    serializedTransaction: string;
+    signers: PublicKey[];
+    recentBlockhash: string;
+    computeUnits: number;
 }
 
 interface SwapResponse {
@@ -36,75 +31,71 @@ interface SwapResponse {
     };
 }
 
-// Core swap preparation logic with full transaction instructions
-export async function prepareSwapTransaction(
-    params: SwapParams
-): Promise<SwapResponse> {
-    const {
-        sourceTokenMint,
-        targetTokenMint,
-        amountInBaseUnits,
-        slippageTolerance,
-        userPublicKey,
-        rpcEndpoint = "https://api.mainnet-beta.solana.com"
-    } = params;
+export async function prepareSwapTransaction(params: SwapParams): Promise<SwapResponse> {
+    const { sourceTokenMint, targetTokenMint, amountInBaseUnits, slippageTolerance, userPublicKey, rpcEndpoint } = params;
 
     try {
-        // 1. Establish validated connection
-        const connection = await establishConnectionWithRetry(rpcEndpoint, 3);
+        const connection = await establishConnectionWithRetry(rpcEndpoint || "https://api.mainnet-beta.solana.com", 3);
         
-        // 2. Get optimized quote with transaction data
         const quote = await getQuote({
             sourceTokenMint,
             targetTokenMint,
             amount: amountInBaseUnits,
             slippageTolerance,
             rpcEndpoint,
-            includeRawTransaction: true // Ensure quote contains transaction data
+            verbose: false
         });
 
-        if (!quote.rawTransaction) {
-            throw new Error("Missing transaction data in quote response");
-        }
+        const poolId = new PublicKey(quote.poolAddresses[0]);
+        const poolKeys = await Liquidity.fetchPoolKeys({
+            connection,
+            poolId,
+            programId: LIQUIDITY_PROGRAM_ID_V4
+        });
 
-        // 3. Parse transaction components
-        const tx = VersionedTransaction.deserialize(Buffer.from(quote.rawTransaction.data, 'base64'));
-        const blockhash = await connection.getLatestBlockhash();
-        
-        // 4. Prepare instruction payload
-        const swapInstructions: SwapInstructions = {
-            transactionVersion: quote.rawTransaction.version,
-            serializedMessage: Buffer.from(tx.message.serialize()).toString('base64'),
-            signers: Array.from(new Set(
-                tx.message.staticAccountKeys
-                    .filter(k => !k.equals(userPublicKey)) // Exclude user's own key
-                    .map(k => k.toBase58())
-            )),
-            additionalAccounts: tx.message.getAccountKeys().keySegments().flat().map(k => k.toBase58()),
-            instructionData: tx.message.compiledInstructions.map(ix => ({
-                programId: tx.message.staticAccountKeys[ix.programIdIndex].toBase58(),
-                accounts: ix.accountKeyIndexes.map(i => 
-                    tx.message.getAccountKeys().get(i)!.toBase58()
-                ),
-                data: Buffer.from(ix.data).toString('base64')
-            }))
-        };
+        const swapInstructions = await Liquidity.makeSwapInstruction({
+            connection,
+            poolKeys,
+            userKeys: {
+                tokenAccountIn: await getAssociatedTokenAddress(userPublicKey, new PublicKey(sourceTokenMint)),
+                tokenAccountOut: await getAssociatedTokenAddress(userPublicKey, new PublicKey(targetTokenMint)),
+                owner: userPublicKey
+            },
+            amountIn: amountInBaseUnits,
+            currencyInMint: new PublicKey(sourceTokenMint),
+            currencyOutMint: new PublicKey(targetTokenMint),
+            slippage: slippageTolerance / 100
+        });
+
+        const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash();
+        const transaction = new VersionedTransaction(
+            new TransactionMessage({
+                payerKey: userPublicKey,
+                recentBlockhash: blockhash,
+                instructions: [swapInstructions]
+            }).compileToV0Message()
+        );
 
         return {
             status: "success",
-            swapInstructions,
+            swapInstructions: {
+                transactionVersion: 'v0',
+                serializedTransaction: Buffer.from(transaction.serialize()).toString('base64'),
+                signers: [userPublicKey],
+                recentBlockhash: blockhash,
+                computeUnits: 1_400_000 
+            },
             metadata: {
-                quoteId: `swap-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+                quoteId: `swap-${Date.now()}-${Math.random().toString(36).slice(2, 11)}`,
                 preparedAt: Date.now(),
-                expiresAt: Date.now() + 60_000 // 1 minute validity
+                expiresAt: Date.now() + 60_000
             }
         };
 
     } catch (error) {
-        console.error("Swap Preparation Error:", error);
         return {
             status: "error",
-            error: this.sanitizeError(error),
+            error: sanitizeError(error),
             metadata: {
                 quoteId: '',
                 preparedAt: Date.now(),
@@ -114,36 +105,32 @@ export async function prepareSwapTransaction(
     }
 }
 
-// Transaction submission handler
-export async function executeSwap(
-    params: SwapParams
-): Promise<SwapResponse> {
+export async function executeSwap(params: SwapParams): Promise<SwapResponse> {
     try {
         const preparation = await prepareSwapTransaction(params);
-        
-        if (preparation.status !== "success") {
-            throw new Error(preparation.error || "Swap preparation failed");
-        }
+        if (preparation.status !== "success") throw new Error(preparation.error);
 
-        // Python integration point
-        const pythonPayload = {
-            instructions: preparation.swapInstructions,
-            publicKey: params.userPublicKey,
-            network: params.rpcEndpoint,
-            commitment: 'confirmed'
-        };
+        const connection = await establishConnectionWithRetry(params.rpcEndpoint || "https://api.mainnet-beta.solana.com", 3);
+        const transaction = VersionedTransaction.deserialize(
+            Buffer.from(preparation.swapInstructions!.serializedTransaction, 'base64')
+        );
+
+        const signature = await connection.sendTransaction(transaction);
+        await connection.confirmTransaction({
+            signature,
+            blockhash: preparation.swapInstructions!.recentBlockhash,
+            lastValidBlockHeight: (await connection.getBlockhash(preparation.swapInstructions!.recentBlockhash)).value!.lastValidBlockHeight
+        });
 
         return {
             status: "success",
-            swapInstructions: preparation.swapInstructions,
             metadata: preparation.metadata
         };
-        
+
     } catch (error) {
-        console.error("Swap Execution Error:", error);
         return {
             status: "error",
-            error: this.sanitizeError(error),
+            error: sanitizeError(error),
             metadata: {
                 quoteId: '',
                 preparedAt: Date.now(),
@@ -153,10 +140,20 @@ export async function executeSwap(
     }
 }
 
-// Security utilities
-private sanitizeError(error: any): string {
-    const msg = error.message || error.toString();
-    return msg.replace(/private key/gi, '*****')
-             .replace(/mnemonic/gi, '*****')
-             .substring(0, 500);
+async function getAssociatedTokenAddress(owner: PublicKey, mint: PublicKey): Promise<PublicKey> {
+    return (await PublicKey.findProgramAddress(
+        [owner.toBuffer(), TOKEN_PROGRAM_ID.toBuffer(), mint.toBuffer()],
+        ASSOCIATED_TOKEN_PROGRAM_ID
+    ))[0];
 }
+
+function sanitizeError(error: any): string {
+    const msg = error instanceof Error ? error.message : String(error);
+    return msg.replace(/[^\w\s]/gi, '')
+             .replace(/(secret|private|mnemonic)/gi, '*****')
+             .substring(0, 200);
+}
+
+// Constants...
+const TOKEN_PROGRAM_ID = new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
+const ASSOCIATED_TOKEN_PROGRAM_ID = new PublicKey('ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL');
